@@ -53,6 +53,18 @@ except ImportError:
             for function in functions:
                 x = checkpoint.checkpoint(function, x, use_reentrant=False)
             return x
+
+try:
+    from timm.models.helpers import resolve_pretrained_cfg
+except ImportError:
+    try:
+        from timm.models._builder import resolve_pretrained_cfg
+    except ImportError:
+        def resolve_pretrained_cfg(variant, pretrained_cfg=None):
+            if pretrained_cfg is not None:
+                return pretrained_cfg
+            return default_cfgs.get(variant, {})
+
 from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
 from timm.models.registry import register_model
 
