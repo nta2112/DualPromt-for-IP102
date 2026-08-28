@@ -89,6 +89,7 @@ def build_continual_dataloader(args):
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
+            drop_last=args.distributed,
         )
 
         data_loader_val = torch.utils.data.DataLoader(
@@ -150,6 +151,11 @@ def get_dataset(dataset, transform_train, transform_val, args,):
     elif dataset == 'Imagenet-R':
         dataset_train = Imagenet_R(args.data_path, train=True, download=True, transform=transform_train).data
         dataset_val = Imagenet_R(args.data_path, train=False, download=True, transform=transform_val).data
+        
+    elif dataset == 'IP102':
+        from continual_datasets.ip102 import IP102
+        dataset_train = IP102(args.data_path, split='train', download=False, transform=transform_train)
+        dataset_val = IP102(args.data_path, split='val', download=False, transform=transform_val)
     
     else:
         raise ValueError('Dataset {} not found.'.format(dataset))

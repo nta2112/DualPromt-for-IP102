@@ -25,6 +25,8 @@ from timm.utils import accuracy
 from timm.optim import create_optimizer
 
 import utils
+import metrics
+import pandas as pd
 
 def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, 
                     criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -100,7 +102,12 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
 
     # switch to evaluation mode
     model.eval()
-    original_model.eval()
+    if original_model is not None:
+        original_model.eval()
+
+    all_features = []
+    all_targets = []
+    all_logits = []
 
     with torch.no_grad():
         for input, target in metric_logger.log_every(data_loader, args.print_freq, header):
@@ -117,6 +124,12 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
             
             output = model(input, task_id=task_id, cls_features=cls_features)
             logits = output['logits']
+            features = output.get('pre_logits', None)
+
+            if features is not None:
+                all_features.append(features.cpu())
+            all_targets.append(target.cpu())
+            all_logits.append(logits.cpu())
 
             if args.task_inc and class_mask is not None:
                 #adding mask to output logits
@@ -139,7 +152,15 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.meters['Acc@1'], top5=metric_logger.meters['Acc@5'], losses=metric_logger.meters['Loss']))
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    if len(all_features) > 0:
+        all_features = torch.cat(all_features, dim=0).numpy()
+    else:
+        all_features = None
+    all_targets = torch.cat(all_targets, dim=0).numpy()
+    all_logits = torch.cat(all_logits, dim=0).numpy()
+
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return stats, all_features, all_targets, all_logits
 
 
 @torch.no_grad()
@@ -147,8 +168,12 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
                     device, task_id=-1, class_mask=None, acc_matrix=None, args=None,):
     stat_matrix = np.zeros((3, args.num_tasks)) # 3 for Acc@1, Acc@5, Loss
 
+    all_features_list = []
+    all_targets_list = []
+    all_logits_list = []
+
     for i in range(task_id+1):
-        test_stats = evaluate(model=model, original_model=original_model, data_loader=data_loader[i]['val'], 
+        test_stats, features, targets, logits = evaluate(model=model, original_model=original_model, data_loader=data_loader[i]['val'], 
                             device=device, task_id=i, class_mask=class_mask, args=args)
 
         stat_matrix[0, i] = test_stats['Acc@1']
@@ -156,6 +181,11 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
         stat_matrix[2, i] = test_stats['Loss']
 
         acc_matrix[i, task_id] = test_stats['Acc@1']
+        
+        if features is not None:
+            all_features_list.append(features)
+        all_targets_list.append(targets)
+        all_logits_list.append(logits)
     
     avg_stat = np.divide(np.sum(stat_matrix, axis=1), task_id+1)
 
@@ -169,6 +199,74 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
 
         result_str += "\tForgetting: {:.4f}\tBackward: {:.4f}".format(forgetting, backward)
     print(result_str)
+    
+    # Compute new metrics
+    if len(all_features_list) > 0:
+        full_features = np.concatenate(all_features_list, axis=0)
+        full_features = full_features / (np.linalg.norm(full_features, axis=1, keepdims=True) + 1e-8)
+        dist_matrix = full_features @ full_features.T
+    else:
+        dist_matrix = None
+        
+    full_targets = np.concatenate(all_targets_list, axis=0)
+    full_logits = np.concatenate(all_logits_list, axis=0)
+    
+    seen_classes = []
+    for i in range(task_id + 1):
+        if class_mask is not None:
+            seen_classes.extend(class_mask[i])
+    seen_classes_set = set(seen_classes)
+    
+    if dist_matrix is not None:
+        mAP = metrics.calculate_mAP(dist_matrix, full_targets)
+        recalls = metrics.calculate_recall_at_k(dist_matrix, full_targets, [1, 5, 10])
+        r1, r5, r10 = recalls[1], recalls[5], recalls[10]
+        r1_seen, r1_unseen = metrics.compute_open_world_recall(dist_matrix, full_targets, seen_classes_set)
+    else:
+        mAP, r1, r5, r10, r1_seen, r1_unseen = 0, 0, 0, 0, 0, 0
+        
+    auroc, fpr95 = metrics.compute_ood_metrics(full_logits, full_targets, list(seen_classes_set))
+    
+    # Track lifelong metrics based on mAP
+    if not hasattr(args, 'map_matrix'):
+        args.map_matrix = np.zeros((args.num_tasks, args.num_tasks))
+        
+    for i in range(task_id + 1):
+        t_targets = all_targets_list[i]
+        if dist_matrix is not None:
+            t_features = all_features_list[i]
+            t_features = t_features / (np.linalg.norm(t_features, axis=1, keepdims=True) + 1e-8)
+            t_dist = t_features @ t_features.T
+            t_mAP = metrics.calculate_mAP(t_dist, t_targets)
+            args.map_matrix[i, task_id] = t_mAP
+        
+    plasticity = args.map_matrix[task_id, task_id] if task_id >= 0 else 0
+    forgetting_map = 0.0
+    if task_id > 0:
+        forgetting_map = np.mean((np.max(args.map_matrix, axis=1) - args.map_matrix[:, task_id])[:task_id])
+    overall_map = np.mean(args.map_matrix[:task_id+1, task_id])
+    
+    # Save to CSV
+    csv_file = os.path.join(args.output_dir if args.output_dir else '.', 'results.csv')
+    write_header = not os.path.exists(csv_file)
+    with open(csv_file, 'a') as f:
+        if write_header:
+            f.write("task,numclass,cnn_top1,nme_top1,R@1,R@5,R@10,mAP,AUROC,FPR95,Plasticity,Forgetting,Overall\n")
+        f.write(f"{task_id},{len(seen_classes_set)},{avg_stat[0]:.4f},0.0,{r1:.4f},{r5:.4f},{r10:.4f},{mAP:.4f},{auroc if auroc is not None else 'None'},{fpr95 if fpr95 is not None else 'None'},{plasticity:.4f},{forgetting_map:.4f},{overall_map:.4f}\n")
+        
+    # Save to json
+    json_file = os.path.join(args.output_dir if args.output_dir else '.', 'history.json')
+    history = {}
+    if os.path.exists(json_file):
+        with open(json_file, 'r') as f:
+            history = json.load(f)
+    history[str(task_id)] = {
+        'R@1': r1, 'R@5': r5, 'R@10': r10, 'mAP': mAP,
+        'AUROC': auroc, 'FPR95': fpr95,
+        'Plasticity': plasticity, 'Forgetting': forgetting_map, 'Overall': overall_map
+    }
+    with open(json_file, 'w') as f:
+        json.dump(history, f, indent=4)
 
     return test_stats
 
@@ -196,14 +294,10 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
                     prev_idx = (slice(None), slice(None), slice(prev_start, prev_end)) if args.use_prefix_tune_for_e_prompt else (slice(None), slice(prev_start, prev_end))
 
                     with torch.no_grad():
-                        if args.distributed:
-                            model.module.e_prompt.prompt.grad.zero_()
-                            model.module.e_prompt.prompt[cur_idx] = model.module.e_prompt.prompt[prev_idx]
-                            optimizer.param_groups[0]['params'] = model.module.parameters()
-                        else:
-                            model.e_prompt.prompt.grad.zero_()
-                            model.e_prompt.prompt[cur_idx] = model.e_prompt.prompt[prev_idx]
-                            optimizer.param_groups[0]['params'] = model.parameters()
+                        unwrapped_model = utils.unwrap_model(model)
+                        unwrapped_model.e_prompt.prompt.grad.zero_()
+                        unwrapped_model.e_prompt.prompt[cur_idx] = unwrapped_model.e_prompt.prompt[prev_idx]
+                        optimizer.param_groups[0]['params'] = unwrapped_model.parameters()
                     
         # Transfer previous learned prompt param keys to the new prompt
         if args.prompt_pool and args.shared_prompt_key:
@@ -215,14 +309,10 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
                 cur_end = (task_id + 1) * args.top_k
 
                 with torch.no_grad():
-                    if args.distributed:
-                        model.module.e_prompt.prompt_key.grad.zero_()
-                        model.module.e_prompt.prompt_key[cur_idx] = model.module.e_prompt.prompt_key[prev_idx]
-                        optimizer.param_groups[0]['params'] = model.module.parameters()
-                    else:
-                        model.e_prompt.prompt_key.grad.zero_()
-                        model.e_prompt.prompt_key[cur_idx] = model.e_prompt.prompt_key[prev_idx]
-                        optimizer.param_groups[0]['params'] = model.parameters()
+                    unwrapped_model = utils.unwrap_model(model)
+                    unwrapped_model.e_prompt.prompt_key.grad.zero_()
+                    unwrapped_model.e_prompt.prompt_key[cur_idx] = unwrapped_model.e_prompt.prompt_key[prev_idx]
+                    optimizer.param_groups[0]['params'] = unwrapped_model.parameters()
      
         # Create new optimizer for each task to clear optimizer status
         if task_id > 0 and args.reinit_optimizer:
