@@ -37,10 +37,22 @@ import torch.utils.checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 try:
-    from timm.models.helpers import build_model_with_cfg, named_apply, adapt_input_conv, checkpoint_seq
+    from timm.models.helpers import build_model_with_cfg, named_apply, adapt_input_conv
 except ImportError:
     from timm.models._builder import build_model_with_cfg
-    from timm.models._manipulate import named_apply, adapt_input_conv, checkpoint_seq
+    from timm.models._manipulate import named_apply, adapt_input_conv
+
+try:
+    from timm.models.helpers import checkpoint_seq
+except ImportError:
+    try:
+        from timm.models._manipulate import checkpoint_seq
+    except ImportError:
+        def checkpoint_seq(functions, x, every=1, flatten=False, **kwargs):
+            import torch.utils.checkpoint as checkpoint
+            for function in functions:
+                x = checkpoint.checkpoint(function, x, use_reentrant=False)
+            return x
 from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
 from timm.models.registry import register_model
 
