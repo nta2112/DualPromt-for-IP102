@@ -37,6 +37,9 @@ def build_continual_dataloader(args):
     transform_train = build_transform(True, args)
     transform_val = build_transform(False, args)
 
+    if args.dataset == 'IP102':
+        args.dataset = 'Split-IP102'
+
     if args.dataset.startswith('Split-'):
         dataset_train, dataset_val = get_dataset(args.dataset.replace('Split-',''), transform_train, transform_val, args)
 
@@ -164,8 +167,12 @@ def get_dataset(dataset, transform_train, transform_val, args,):
 
 def split_single_dataset(dataset_train, dataset_val, args):
     nb_classes = len(dataset_val.classes)
-    assert nb_classes % args.num_tasks == 0
-    classes_per_task = nb_classes // args.num_tasks
+
+    if nb_classes == 25 and args.num_tasks == 4:
+        task_sizes = [7, 6, 6, 6]
+    else:
+        assert nb_classes % args.num_tasks == 0
+        task_sizes = [nb_classes // args.num_tasks] * args.num_tasks
 
     labels = [i for i in range(nb_classes)]
     
@@ -175,10 +182,11 @@ def split_single_dataset(dataset_train, dataset_val, args):
     if args.shuffle:
         random.shuffle(labels)
 
-    for _ in range(args.num_tasks):
+    for i in range(args.num_tasks):
         train_split_indices = []
         test_split_indices = []
         
+        classes_per_task = task_sizes[i]
         scope = labels[:classes_per_task]
         labels = labels[classes_per_task:]
 
