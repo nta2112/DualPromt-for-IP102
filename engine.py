@@ -166,21 +166,22 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
 @torch.no_grad()
 def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, data_loader, 
                     device, task_id=-1, class_mask=None, acc_matrix=None, args=None,):
-    stat_matrix = np.zeros((3, args.num_tasks)) # 3 for Acc@1, Acc@5, Loss
+    stat_matrix = np.zeros((3, task_id+1)) # 3 for Acc@1, Acc@5, Loss
 
     all_features_list = []
     all_targets_list = []
     all_logits_list = []
 
-    for i in range(task_id+1):
+    # Loop over all tasks (both seen and unseen) for Open-World evaluation
+    for i in range(args.num_tasks):
         test_stats, features, targets, logits = evaluate(model=model, original_model=original_model, data_loader=data_loader[i]['val'], 
                             device=device, task_id=i, class_mask=class_mask, args=args)
 
-        stat_matrix[0, i] = test_stats['Acc@1']
-        stat_matrix[1, i] = test_stats['Acc@5']
-        stat_matrix[2, i] = test_stats['Loss']
-
-        acc_matrix[i, task_id] = test_stats['Acc@1']
+        if i <= task_id:
+            stat_matrix[0, i] = test_stats['Acc@1']
+            stat_matrix[1, i] = test_stats['Acc@5']
+            stat_matrix[2, i] = test_stats['Loss']
+            acc_matrix[i, task_id] = test_stats['Acc@1']
         
         if features is not None:
             all_features_list.append(features)
